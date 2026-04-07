@@ -1,0 +1,8 @@
+-r base.txt
+
+# DCU environments usually need vendor-provided PaddlePaddle and PyTorch wheels.
+# Install those platform builds first, then install the Python-side training stack below.
+datasets>=2.18,<3.0
+transformers>=4.40,<5.0
+peft>=0.10,<1.0
+trl>=0.8,<1.0
