@@ -1,7 +1,10 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-档案智能分类系统 - LLM客户端（llama.cpp，兼容NVIDIA/DCU）
+档案智能分类系统 - LLM客户端（vLLM OpenAI 兼容接口）
+
+本模块只持有一个 OpenAI SDK 客户端，实际推理在外部 vLLM server 中执行。
+启动 server 的方式见 docs/vllm_server.md。
 """
 
 import json
@@ -10,9 +13,9 @@ import re
 from typing import Dict
 
 try:
-    from llama_cpp import Llama
+    from openai import OpenAI
 except ImportError:
-    Llama = None
+    OpenAI = None
 
 from config.config import Config
 from constants import METADATA_SCHEMA
@@ -22,27 +25,40 @@ logger = logging.getLogger(__name__)
 
 class LlmClient:
     """
-    封装llama.cpp本地推理，行为与原版Ollama完全一致。
-    GGUF + Q4_K_M量化，chat template原生支持，效果等价于 ollama run qwen2.5:14b
+    通过 OpenAI 兼容 API 调用远端 vLLM 服务。
+
+    与旧版 llama-cpp 内嵌推理的差异：
+      - 不再加载模型文件，只持有 HTTP 客户端
+      - `model` 字段传服务端 `--served-model-name`，非本地路径
+      - JSON 强制依赖 vLLM 的 `response_format={"type": "json_object"}`
+      - Qwen3 系列通过 `chat_template_kwargs.enable_thinking=False` 关闭思考模式
     """
 
-    def __init__(self, model_path: str = Config.LLM_MODEL_PATH):
-        if Llama is None:
-            raise RuntimeError("llama_cpp is not installed. Install dependencies in runtime environment first.")
+    def __init__(
+        self,
+        base_url: str = Config.LLM_BASE_URL,
+        api_key: str = Config.LLM_API_KEY,
+        model_name: str = Config.LLM_MODEL_NAME,
+        timeout: float = Config.LLM_REQUEST_TIMEOUT,
+    ):
+        if OpenAI is None:
+            raise RuntimeError(
+                "openai SDK is not installed. Install with: pip install openai"
+            )
         self.metadata_schema = METADATA_SCHEMA
+        self.model_name = model_name
 
-        logger.info(f"[LLM初始化] 加载模型: {model_path}")
-        logger.info(f"[LLM初始化] GPU层数: {Config.LLM_N_GPU_LAYERS}")
+        logger.info(f"[LLM初始化] vLLM endpoint: {base_url}")
+        logger.info(f"[LLM初始化] 模型名: {model_name}")
 
-        self.llm = Llama(
-            model_path=model_path,
-            n_ctx=Config.LLM_N_CTX,
-            n_gpu_layers=Config.LLM_N_GPU_LAYERS,
-            verbose=False,
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
         )
-        logger.info("[LLM初始化] 模型加载完成")
+        logger.info("[LLM初始化] OpenAI 客户端就绪")
 
-    # ── 公开接口（与原版完全一致）─────────────────────────────────────────────
+    # ── 公开接口 ──────────────────────────────────────────────────────────────
 
     def extract_metadata(self, ocr_text: str, prompt: str) -> Dict:
         logger.info("[LLM] 正在分析文本并提取元数据...")
@@ -51,7 +67,7 @@ class LlmClient:
             return {}
 
         try:
-            formatted_prompt = prompt.format(ocr_text=ocr_text)
+            formatted_prompt = prompt.replace("{ocr_text}", ocr_text)
             response = self._generate(formatted_prompt)
 
             logger.info(f"[LLM响应] 原始响应长度: {len(response)} 字符")
@@ -72,32 +88,41 @@ class LlmClient:
             logger.exception(f"[LLM错误] {str(e)}")
             return {}
 
-    # ── 推理（等价于原版 self.llm.invoke，含chat template + JSON强制）─────────
+    # ── 推理调用 ──────────────────────────────────────────────────────────────
 
     def _generate(self, prompt: str) -> str:
         """
-        使用chat completion接口，与Ollama行为一致：
-        - 自动应用Qwen2.5的chat template
-        - response_format强制JSON输出，等价于Ollama的format:json
+        调用 vLLM OpenAI 兼容 chat completions 接口。
+
+        - response_format=json_object：vLLM 0.6+ 原生支持 guided JSON
+        - chat_template_kwargs.enable_thinking：Qwen3 专有开关，JSON 场景强制 False
         """
-        response = self.llm.create_chat_completion(
+        extra_body = {
+            "chat_template_kwargs": {
+                "enable_thinking": Config.LLM_ENABLE_THINKING,
+            }
+        }
+
+        response = self.client.chat.completions.create(
+            model=self.model_name,
             messages=[
                 {
                     "role": "system",
-                    "content": "你是专业档案整理员，只输出JSON格式的元数据，不输出任何其他内容。"
+                    "content": "你是专业档案整理员，只输出JSON格式的元数据，不输出任何其他内容。",
                 },
                 {
                     "role": "user",
-                    "content": prompt
-                }
+                    "content": prompt,
+                },
             ],
             temperature=Config.LLM_TEMPERATURE,
             max_tokens=Config.LLM_MAX_TOKENS,
-            response_format={"type": "json_object"},  # 等价于Ollama format:json
+            response_format={"type": "json_object"},
+            extra_body=extra_body,
         )
-        return response["choices"][0]["message"]["content"]
+        return response.choices[0].message.content or ""
 
-    # ── 以下原版逻辑一字未改 ──────────────────────────────────────────────────
+    # ── 响应清洗与解析（与推理后端无关，逻辑保留）──────────────────────────────
 
     def _clean_response(self, response: str) -> str:
         response = response.strip()
@@ -135,7 +160,10 @@ class LlmClient:
         except json.JSONDecodeError as e:
             logger.warning(f"[JSON解析失败] {str(e)}")
             logger.info("[尝试修复JSON格式...]")
-        fixed = response.replace("'", '"')
+        # 仅替换 JSON 结构位的单引号：key 周围（{'k': / ,'k':）与简单 value 位置（: 'v',）
+        # 不做全局 replace，避免破坏字符串值中合法的单引号
+        fixed = re.sub(r"([{,]\s*)'([^'\n]+?)'(\s*:)", r'\1"\2"\3', response)
+        fixed = re.sub(r"(:\s*)'([^'\n]*?)'(\s*[,}])", r'\1"\2"\3', fixed)
         fixed = re.sub(r',(\s*[}\]])', r'\1', fixed)
         try:
             metadata = json.loads(fixed)
@@ -189,6 +217,3 @@ class LlmClient:
             else:
                 metadata[key] = value
         return metadata
-
-
-

@@ -20,13 +20,16 @@ from constants import (
     OCR_SHORT_TEXT_LEN,
 )
 
-# 同行合并：两个文本框垂直中心点之差小于此阈值则视为同一行
-# 单位：像素，可根据实际扫描件字号调整
-_SAME_LINE_Y_THRESHOLD = 15
+# 同行合并阈值：以该页文本框中位高度的倍数衡量
+# 两个文本框垂直中心点之差 < median_h * _SAME_LINE_Y_RATIO 视为同行
+_SAME_LINE_Y_RATIO = 0.6
 
-# 水平间距：同行两个文本框之间的像素间距超过此值则插入空格
-# 单位：像素
-_SPACE_INSERT_THRESHOLD = 20
+# 水平间距阈值：以该页文本框中位高度的倍数衡量
+# 同行相邻文本框水平间距 > median_h * _SPACE_INSERT_RATIO 则插入空格
+_SPACE_INSERT_RATIO = 0.8
+
+# 中位字高取不到时的兜底（像素），主要防止空页或退化输入
+_FALLBACK_LINE_HEIGHT = 20.0
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +157,15 @@ class OcrClient:
             candidate = self._run_candidate(variant.image, variant.label)
             if self._is_better_candidate(candidate, best):
                 best = candidate
+                # 当前 best 已满足质量门槛（不再触发 retry 判定），
+                # 剩余预处理版本无需再跑 OCR，省掉整轮推理
+                if not self._should_retry_with_preprocess(best):
+                    logger.info(
+                        "    · %s 版本质量已达标，剩余 %s 个预处理版本跳过",
+                        variant.label,
+                        len(variants) - variants.index(variant) - 1,
+                    )
+                    break
 
         return best
 
@@ -289,37 +301,31 @@ class OcrClient:
         from PIL import Image
 
         pixels = np.asarray(image, dtype=np.uint8)
-        histogram = np.bincount(pixels.ravel(), minlength=256)
-        total = pixels.size
-        weighted_total = float(np.dot(np.arange(256), histogram))
+        histogram = np.bincount(pixels.ravel(), minlength=256).astype(np.float64)
+        total = float(pixels.size)
 
-        threshold = 0
-        background_weight = 0.0
-        background_sum = 0.0
-        max_variance = -1.0
+        # 累积直方图与加权累积和，整段向量化替代原 256 次 Python 循环
+        levels = np.arange(256, dtype=np.float64)
+        bg_weight = np.cumsum(histogram)
+        fg_weight = total - bg_weight
+        bg_sum = np.cumsum(histogram * levels)
+        total_sum = bg_sum[-1]
 
-        for gray_value, count in enumerate(histogram):
-            background_weight += count
-            if background_weight == 0:
-                continue
+        # 分母为 0 的两端用 0 填充，argmax 会自然忽略
+        valid = (bg_weight > 0) & (fg_weight > 0)
+        between = np.zeros_like(bg_weight)
+        bg_mean = np.where(valid, bg_sum / np.where(bg_weight == 0, 1, bg_weight), 0.0)
+        fg_mean = np.where(
+            valid,
+            (total_sum - bg_sum) / np.where(fg_weight == 0, 1, fg_weight),
+            0.0,
+        )
+        between[valid] = (
+            bg_weight[valid] * fg_weight[valid] * (bg_mean[valid] - fg_mean[valid]) ** 2
+        )
 
-            foreground_weight = total - background_weight
-            if foreground_weight == 0:
-                break
-
-            background_sum += gray_value * count
-            mean_background = background_sum / background_weight
-            mean_foreground = (weighted_total - background_sum) / foreground_weight
-            between_variance = (
-                background_weight
-                * foreground_weight
-                * (mean_background - mean_foreground) ** 2
-            )
-            if between_variance > max_variance:
-                max_variance = between_variance
-                threshold = gray_value
-
-        binary = np.where(pixels >= threshold, 255, 0).astype("uint8")
+        threshold = int(between.argmax())
+        binary = np.where(pixels >= threshold, 255, 0).astype(np.uint8)
         return Image.fromarray(binary, mode="L")
 
     def _is_better_candidate(
@@ -361,16 +367,20 @@ class OcrClient:
           bbox 四个顶点顺序：左上、右上、右下、左下
 
         算法：
-          1. 计算每个文本框的中心点 (cx, cy)
-          2. 按 cy 排序，cy 差值小于阈值的归为同一行
-          3. 同行内按 cx 排序（从左到右）
-          4. 同行相邻文本框水平间距超过阈值则插入空格
-          5. 行间用换行符连接
+          1. 计算每个文本框的中心点 (cx, cy) 与字高 h
+          2. 取所有字高的中位数作为该页的基准行高 median_h
+          3. 按 cy 排序；cy 差 < median_h * _SAME_LINE_Y_RATIO 归为同一行
+          4. 同行内按 cx 排序（从左到右）
+          5. 相邻文本框水平间距 > median_h * _SPACE_INSERT_RATIO 则插入空格
+          6. 行间用换行符连接
+
+        阈值相对于字高，避免在不同 DPI / 预处理缩放下失配。
         """
         if not ocr_lines:
             return ""
 
         boxes = []
+        heights = []
         for line in ocr_lines:
             bbox = line[0]
             text = line[1][0]
@@ -379,7 +389,11 @@ class OcrClient:
             cy = sum(p[1] for p in bbox) / 4
             x_right = max(p[0] for p in bbox)
             x_left = min(p[0] for p in bbox)
+            y_top = min(p[1] for p in bbox)
+            y_bot = max(p[1] for p in bbox)
+            h = max(1.0, y_bot - y_top)
 
+            heights.append(h)
             boxes.append(
                 {
                     "text": text,
@@ -390,13 +404,21 @@ class OcrClient:
                 }
             )
 
+        heights_sorted = sorted(heights)
+        median_h = heights_sorted[len(heights_sorted) // 2] if heights_sorted else _FALLBACK_LINE_HEIGHT
+        if median_h <= 0:
+            median_h = _FALLBACK_LINE_HEIGHT
+
+        same_line_threshold = median_h * _SAME_LINE_Y_RATIO
+        space_insert_threshold = median_h * _SPACE_INSERT_RATIO
+
         boxes.sort(key=lambda b: b["cy"])
 
         rows: List[List[dict]] = []
         current_row: List[dict] = [boxes[0]]
 
         for box in boxes[1:]:
-            if abs(box["cy"] - current_row[-1]["cy"]) <= _SAME_LINE_Y_THRESHOLD:
+            if abs(box["cy"] - current_row[-1]["cy"]) <= same_line_threshold:
                 current_row.append(box)
             else:
                 rows.append(current_row)
@@ -410,7 +432,7 @@ class OcrClient:
             line_parts = [row[0]["text"]]
             for i in range(1, len(row)):
                 gap = row[i]["x_left"] - row[i - 1]["x_right"]
-                if gap > _SPACE_INSERT_THRESHOLD:
+                if gap > space_insert_threshold:
                     line_parts.append(" ")
                 line_parts.append(row[i]["text"])
 

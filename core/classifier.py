@@ -30,10 +30,10 @@ class ArchiveClassifier:
     def __init__(
         self,
         ocr_lang: str = Config.OCR_LANG,
-        model_path: str = Config.LLM_MODEL_PATH,   # 替换原来的base_model_path等参数
+        model_name: str = Config.LLM_MODEL_NAME,
     ):
         self.ocr_client = OcrClient(lang=ocr_lang)
-        self.llm_client = LlmClient(model_path=model_path)
+        self.llm_client = LlmClient(model_name=model_name)
         self.rules_engine = RulesEngine()
         self.metadata_schema = METADATA_SCHEMA
         self.extraction_prompt = self._build_extraction_prompt()
@@ -116,7 +116,6 @@ class ArchiveClassifier:
         for i, ex in enumerate(data["examples"], 1):
             label = ex["label"]
             output = json.dumps(ex["output"], ensure_ascii=False, indent=2)
-            output = output.replace("{", "{{").replace("}", "}}")
             blocks.append(f"【JSON输出示例{i} - {label}】\n{output}")
 
         return "\n\n".join(blocks)
@@ -140,7 +139,7 @@ class ArchiveClassifier:
 【输出格式要求 - 最高优先级】
 - 只输出一个JSON对象，不得包含任何其他文字、解释、markdown
 - 不得输出规则说明、著录指南或任何非JSON内容
-- 第一个字符必须是 {{{{，最后一个字符必须是 }}}}
+- 第一个字符必须是 {{，最后一个字符必须是 }}
 - JSON的key必须与下方【需提取的字段】完全一致，禁止使用其他字段名
 
 {rules_priority}
@@ -166,5 +165,5 @@ class ArchiveClassifier:
 
 {examples}
 
-再次强调：直接输出JSON对象，第一个字符是 {{{{，不得有任何前置文字：
+再次强调：直接输出JSON对象，第一个字符是 {{，不得有任何前置文字：
 """

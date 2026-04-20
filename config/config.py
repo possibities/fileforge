@@ -69,15 +69,17 @@ class Config:
     OCR_PREPROCESS_MAX_SIDE: int = _env_int("OCR_PREPROCESS_MAX_SIDE", 2800)
     OCR_PREPROCESS_CONTRAST: float = _env_float("OCR_PREPROCESS_CONTRAST", 1.25)
 
-    # ── LLM ──────────────────────────────────────────────────────────────────
-    LLM_MODEL_PATH: str = _env_str(
-        "LLM_MODEL_PATH",
-        "/data/models/qwen2.5-14b-gguf/Qwen2.5-14B-Instruct-Q4_K_M.gguf",
-    )
+    # ── LLM (vLLM OpenAI 兼容服务) ──────────────────────────────────────────
+    # 客户端向 vLLM server 发 HTTP 请求，不再在本进程加载模型。
+    # 服务启动方式见 docs/vllm_server.md。
+    LLM_BASE_URL: str = _env_str("LLM_BASE_URL", "http://localhost:8000/v1")
+    LLM_API_KEY: str = _env_str("LLM_API_KEY", "EMPTY")  # vLLM 默认不校验
+    LLM_MODEL_NAME: str = _env_str("LLM_MODEL_NAME", "qwen3-32b-awq")
     LLM_TEMPERATURE: float = _env_float("LLM_TEMPERATURE", 0.1)
-    LLM_N_CTX: int = _env_int("LLM_N_CTX", 8192)          # 上下文窗口
-    LLM_N_GPU_LAYERS: int = _env_int("LLM_N_GPU_LAYERS", -1)  # -1 = 全部层放GPU；CPU推理改为0
     LLM_MAX_TOKENS: int = _env_int("LLM_MAX_TOKENS", 512)
+    LLM_REQUEST_TIMEOUT: float = _env_float("LLM_REQUEST_TIMEOUT", 300.0)
+    # Qwen3 思考模式会在输出前追加 <think>...</think>，JSON 抽取场景必须关闭
+    LLM_ENABLE_THINKING: bool = _env_bool("LLM_ENABLE_THINKING", False)
 
     # ── 日志 ─────────────────────────────────────────────────────────────────
     OCR_PREVIEW_LENGTH: int = _env_int("OCR_PREVIEW_LENGTH", 500)

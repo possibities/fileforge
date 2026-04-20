@@ -45,7 +45,7 @@ def main() -> None:
         Exporter.initialize(Config.EXPORTER_CONFIG_PATH)
         classifier = ArchiveClassifier(
             ocr_lang=Config.OCR_LANG,
-            model_path=Config.LLM_MODEL_PATH,
+            model_name=Config.LLM_MODEL_NAME,
         )
         batch_processor = BatchProcessor(classifier)
     except Exception as exc:

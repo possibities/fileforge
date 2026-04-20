@@ -138,7 +138,7 @@ class BatchProcessor:
                         image_paths,
                     )
                     if metadata:
-                        metadata["\u9875\u6570"] = len(image_paths)
+                        metadata["页数"] = len(image_paths)
                         metadata["source_folder"] = source_folder
                         metadata["processed_time"] = created_time
                         metadata = sequence_generator.assign(metadata)
@@ -172,7 +172,7 @@ class BatchProcessor:
             results.append(result)
 
             if output_path:
-                safe_name = archive_name.replace("/", "__").replace("\\", "__")
+                safe_name = self._sanitize_filename(archive_name)
                 item_name = f"{idx:04d}_{safe_name}_result.json"
                 self._save_json(result, output_path / item_name)
 
@@ -230,6 +230,15 @@ class BatchProcessor:
     def _save_json(self, data: Dict, path: Path) -> None:
         with open(path, "w", encoding="utf-8") as file_obj:
             json.dump(data, file_obj, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _sanitize_filename(name: str) -> str:
+        # Windows 非法: < > : " / \ | ? *；控制符 \x00-\x1f；两端空格和点（Windows 不允许）
+        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '__', name)
+        cleaned = cleaned.strip(' .')
+        if not cleaned or re.fullmatch(r'_+', cleaned):
+            return "unnamed"
+        return cleaned
 
     @staticmethod
     def _build_result(

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 档案智能分类系统 - 规则引擎
@@ -6,6 +6,7 @@
 
 import re
 import logging
+from dataclasses import dataclass
 from typing import Dict
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,21 @@ from constants import (
     PARTY_TRAINING_KEYWORDS,
     BUSINESS_FALSE_POSITIVE_DOC_TYPES,
     BUSINESS_LEGITIMATE_KEYWORDS,
+    VALID_SECURITY_LEVELS,
+    VALID_SECRET_PERIODS,
 )
+
+
+@dataclass
+class _RuleCtx:
+    """补充规则之间共享的可变上下文。
+
+    period_locked 由规则 2 置 True 后，其余规则不得改 metadata["保管期限"]。
+    """
+    metadata: Dict
+    title: str
+    content: str
+    period_locked: bool = False
 
 
 class RulesEngine:
@@ -50,7 +65,7 @@ class RulesEngine:
       0. _force_fix_fields             — 强制字段修正
       1. _apply_supplementary_rules    — 10条补充规则（最高优先级）
       2. _apply_open_status_rules      — 开放状态与延期开放理由判定
-      3. _validate_classification_code — 编码格式校验
+      3. _validate_classification_code — 编码格式校验（统一收尾，补充规则内部不再调用）
       4. _clean_title                  — 题名后处理（去除LLM拼入的编号/日期/重复内容）
     """
 
@@ -76,7 +91,6 @@ class RulesEngine:
             metadata["立档单位名称"] = metadata.get("责任者")
 
         # 密级合法值校验：不在允许范围内一律置null
-        VALID_SECURITY_LEVELS = {"非涉密", "内部", "秘密", "机密", "绝密"}
         current_level = metadata.get("密级")
         if current_level and current_level not in VALID_SECURITY_LEVELS:
             logger.warning(f"[强制修正] 密级非法值: {current_level} → null")
@@ -84,7 +98,6 @@ class RulesEngine:
             metadata["保密期限"] = None
 
         # 保密期限合法值校验
-        VALID_SECRET_PERIODS = {"1年", "5年", "10年"}
         current_period = metadata.get("保密期限")
         if current_period and current_period not in VALID_SECRET_PERIODS:
             logger.warning(f"[强制修正] 保密期限非法值: {current_period} → null")
@@ -96,174 +109,214 @@ class RulesEngine:
 
     def _apply_supplementary_rules(self, metadata: Dict, ocr_text: str) -> Dict:
         """
-        10条补充规则，优先级高于LLM输出。
+        按固定顺序应用 10 条补充规则。
 
-        执行顺序说明：
-          - 规则2（简报→10年）最先执行，并设置 period_locked=True
-          - period_locked=True 时，后续所有规则不得修改保管期限
-          - 规则7（文件编号兜底）最后执行，但受 period_locked 保护
-          - 规则1（培训）不直接覆盖保管期限，仅在LLM判定低于30年时提升
+        设计要点：
+          - 规则 2（简报→10年）最先执行；若触发则 ctx.period_locked=True
+          - 任何后续规则修改保管期限前都必须检查 period_locked
+          - 规则 7（文件编号兜底）最后执行
+          - 分类编码校验统一由 apply_all 收尾一次，规则内部不再触发
         """
         if not metadata:
             return metadata
 
         title = str(metadata.get("题名") or "").strip()
-        text = ocr_text or ""
-        content = title + " " + text
-
-        # 期限锁标志：规则2触发后设True，后续规则不得修改保管期限
-        period_locked = False
-
-        # ── 规则2: 简报 → 10年（最先执行，锁定期限）─────────────────────────
-        if "简报" in title:
-            logger.info(f"[补充规则2] 简报，保管期限 → 10年（已锁定，后续规则不覆盖）")
-            metadata["保管期限"] = "10年"
-            period_locked = True
-
-            # 规则2扩展：简报分类修正
-            # 规则引擎接管分类判断，防止LLM将党务简报误归综合类/业务类
-            if any(kw in content for kw in BRIEFING_PARTY_KEYWORDS):
-                logger.info(f"[补充规则2-分类] 党务简报，分类 → 党群类")
-                metadata["实体分类名称"] = "党群类"
-            elif any(kw in content for kw in BRIEFING_BUSINESS_KEYWORDS):
-                logger.info(f"[补充规则2-分类] 档案/培训简报，分类 → 业务类")
-                metadata["实体分类名称"] = "业务类"
-            else:
-                logger.info(f"[补充规则2-分类] 一般简报，分类 → 综合类")
-                metadata["实体分类名称"] = "综合类"
-            metadata = self._validate_classification_code(metadata)
-
-        # ── 规则1: 公司内部培训 → 业务类 ─────────────────────────────────────
-        # 排除条件1：题名含管理类词汇（培训制度/经费/管理/考勤等）
-        # 排除条件2：内容涉及党务/党员/党建等党务培训
-        # 保管期限处理：不硬编码，仅在LLM判定低于30年时提升到30年（简报除外）
-        is_training = any(kw in title for kw in TRAINING_KEYWORDS)
-        is_training_mgmt = any(kw in title for kw in TRAINING_MGMT_KEYWORDS)
-        is_party_training = any(kw in content for kw in PARTY_TRAINING_KEYWORDS)
-
-        if is_training and not is_training_mgmt and not is_party_training:
-            logger.info(f"[补充规则1] 公司内部培训，分类 → 业务类")
-            metadata["实体分类名称"] = "业务类"
-            # 期限：未锁定时，若LLM判定低于30年则提升；永久则保留
-            if not period_locked:
-                current_period = metadata.get("保管期限", "")
-                if PERIOD_ORDER.get(current_period, 0) < PERIOD_ORDER["30年"]:
-                    logger.info(f"[补充规则1] 培训类保管期限: {current_period} → 30年")
-                    metadata["保管期限"] = "30年"
-            metadata = self._validate_classification_code(metadata)
-
-        # ── 规则3: 档案寄存地址变更 → 10年 ───────────────────────────────────
-        if any(kw in content for kw in ADDRESS_CHANGE_KEYWORDS):
-            if not period_locked:
-                logger.info(f"[补充规则3] 档案寄存地址变更，保管期限 → 10年")
-                metadata["保管期限"] = "10年"
-            else:
-                logger.info(f"[补充规则3] 档案寄存地址变更，期限已锁定（{metadata.get('保管期限')}），跳过")
-
-        # ── 规则4: 公司内部安装/维修类函和通知 → 10年 ────────────────────────
-        if any(kw in content for kw in MAINTENANCE_KEYWORDS):
-            if any(doc_type in title for doc_type in MAINTENANCE_DOC_TYPES):
-                if not period_locked:
-                    logger.info(f"[补充规则4] 安装/维修类通知或函，保管期限 → 10年")
-                    metadata["保管期限"] = "10年"
-                else:
-                    logger.info(f"[补充规则4] 安装/维修类，期限已锁定（{metadata.get('保管期限')}），跳过")
-
-        # ── 规则5: 一般事务性通知 → 10年 ─────────────────────────────────────
-        # 有文件编号 或 含重要关键词 → 不触发
-        if "通知" in title:
-            file_number = metadata.get("文件编号")
-            has_number = (
-                file_number
-                and str(file_number).strip()
-                and str(file_number) != "null"
-            )
-            is_important = any(kw in content for kw in IMPORTANT_NOTICE_KEYWORDS)
-            if not has_number and not is_important:
-                if not period_locked:
-                    logger.info(f"[补充规则5] 一般事务通知，保管期限 → 10年")
-                    metadata["保管期限"] = "10年"
-                else:
-                    logger.info(f"[补充规则5] 一般事务通知，期限已锁定（{metadata.get('保管期限')}），跳过")
-
-        # ── 规则6: 公司内部制度/管理办法/条例/实施细则/章程 → 综合类，30年 ────
-        if any(kw in title for kw in REGULATION_KEYWORDS):
-            if any(kw in content for kw in INTERNAL_ORG_KEYWORDS):
-                logger.info(f"[补充规则6] 公司内部制度，分类 → 综合类")
-                metadata["实体分类名称"] = "综合类"
-                if not period_locked:
-                    logger.info(f"[补充规则6] 保管期限 → 30年")
-                    metadata["保管期限"] = "30年"
-                else:
-                    logger.info(f"[补充规则6] 期限已锁定（{metadata.get('保管期限')}），不修改期限")
-                metadata = self._validate_classification_code(metadata)
-
-        # ── 规则8: 批评通报 → 30年 ────────────────────────────────────────────
-        if any(kw in title for kw in ["批评通报", "通报批评"]):
-            if not period_locked:
-                logger.info(f"[补充规则8] 批评通报，保管期限 → 30年")
-                metadata["保管期限"] = "30年"
-            else:
-                logger.info(f"[补充规则8] 批评通报，期限已锁定（{metadata.get('保管期限')}），跳过")
-
-        # ── 规则9: 中标结果公示/中标通知函 → 30年 ────────────────────────────
-        if "中标" in title and any(kw in title for kw in BID_KEYWORDS):
-            if not period_locked:
-                logger.info(f"[补充规则9] 中标结果/通知函，保管期限 → 30年")
-                metadata["保管期限"] = "30年"
-            else:
-                logger.info(f"[补充规则9] 中标结果，期限已锁定（{metadata.get('保管期限')}），跳过")
-
-        # ── 规则10: 党支部更换组织/委员/书记的请示 → 党群类，30年 ──────────
-        # 排除：换届选举结果类文件（属永久，不得被降级）
-        if any(kw in content for kw in PARTY_BRANCH_KEYWORDS):
-            is_adjust = any(kw in content for kw in PARTY_BRANCH_ADJUST_KEYWORDS)
-            is_target = any(kw in content for kw in PARTY_BRANCH_TARGET_KEYWORDS)
-            is_request = "请示" in content
-            is_election_result = any(kw in content for kw in PARTY_BRANCH_ELECTION_RESULT_KEYWORDS)
-
-            if is_adjust and is_target and is_request and not is_election_result:
-                logger.info(f"[补充规则10] 党支部调整请示，分类 → 党群类")
-                metadata["实体分类名称"] = "党群类"
-                if not period_locked:
-                    logger.info(f"[补充规则10] 保管期限 → 30年")
-                    metadata["保管期限"] = "30年"
-                else:
-                    logger.info(f"[补充规则10] 期限已锁定（{metadata.get('保管期限')}），不修改期限")
-                metadata = self._validate_classification_code(metadata)
-            elif is_election_result:
-                logger.info(f"[补充规则10] 检测到换届选举结果，跳过（期限应为永久）")
-
-        # ── 业务类误判兜底：非档案工作/非培训文件 → 强制纠正为综合类 ───────────
-        # 触发条件：LLM将文件分到业务类，但文种/特征明显属于综合类
-        # 排除条件：题名含明确的档案工作词或培训词（说明确实是业务类）
-        if metadata.get("实体分类名称") == "业务类":
-            is_legitimate_business = any(kw in content for kw in BUSINESS_LEGITIMATE_KEYWORDS)
-            if not is_legitimate_business:
-                is_false_positive = any(doc_type in title for doc_type in BUSINESS_FALSE_POSITIVE_DOC_TYPES)
-                if is_false_positive:
-                    logger.warning(f"[业务类兜底] 题名含综合类文种（{title}），非档案/培训文件，强制纠正 → 综合类")
-                    metadata["实体分类名称"] = "综合类"
-                    metadata = self._validate_classification_code(metadata)
-
-        # ── 规则7: 本单位带文件编号 → 最少30年（兜底，最后执行）──────────────
-        # [Fix3] 使用 PERIOD_ORDER 比较，任何低于30年的期限均提升
-        file_number = metadata.get("文件编号")
-        has_number = (
-            file_number
-            and str(file_number).strip()
-            and str(file_number) != "null"
+        ctx = _RuleCtx(
+            metadata=metadata,
+            title=title,
+            content=title + " " + (ocr_text or ""),
         )
-        if has_number:
-            current_period = metadata.get("保管期限", "")
-            if PERIOD_ORDER.get(current_period, 0) < PERIOD_ORDER["30年"]:
-                if not period_locked:
-                    logger.info(f"[补充规则7] 本单位带文件编号，保管期限: {current_period} → 30年")
-                    metadata["保管期限"] = "30年"
-                else:
-                    logger.info(f"[补充规则7] 带文件编号，但期限已锁定（{current_period}），跳过")
 
-        return metadata
+        self._rule_briefing(ctx)
+        self._rule_training(ctx)
+        self._rule_address_change(ctx)
+        self._rule_maintenance(ctx)
+        self._rule_general_notice(ctx)
+        self._rule_regulation(ctx)
+        self._rule_criticism(ctx)
+        self._rule_bid(ctx)
+        self._rule_party_branch(ctx)
+        self._rule_business_false_positive(ctx)
+        self._rule_with_file_number(ctx)
+
+        return ctx.metadata
+
+    # ── 单条规则实现（按 _apply_supplementary_rules 的调用顺序）────────────
+
+    def _rule_briefing(self, ctx: _RuleCtx) -> None:
+        """规则 2: 简报 → 10 年（最先执行，锁定期限）+ 分类校准"""
+        if "简报" not in ctx.title:
+            return
+        logger.info("[补充规则2] 简报，保管期限 → 10年（已锁定，后续规则不覆盖）")
+        ctx.metadata["保管期限"] = "10年"
+        ctx.period_locked = True
+
+        if any(kw in ctx.content for kw in BRIEFING_PARTY_KEYWORDS):
+            logger.info("[补充规则2-分类] 党务简报，分类 → 党群类")
+            ctx.metadata["实体分类名称"] = "党群类"
+        elif any(kw in ctx.content for kw in BRIEFING_BUSINESS_KEYWORDS):
+            logger.info("[补充规则2-分类] 档案/培训简报，分类 → 业务类")
+            ctx.metadata["实体分类名称"] = "业务类"
+        else:
+            logger.info("[补充规则2-分类] 一般简报，分类 → 综合类")
+            ctx.metadata["实体分类名称"] = "综合类"
+
+    def _rule_training(self, ctx: _RuleCtx) -> None:
+        """规则 1: 公司内部培训 → 业务类，期限至少 30 年（不硬覆盖）"""
+        is_training = any(kw in ctx.title for kw in TRAINING_KEYWORDS)
+        is_training_mgmt = any(kw in ctx.title for kw in TRAINING_MGMT_KEYWORDS)
+        is_party_training = any(kw in ctx.content for kw in PARTY_TRAINING_KEYWORDS)
+        if not is_training or is_training_mgmt or is_party_training:
+            return
+        logger.info("[补充规则1] 公司内部培训，分类 → 业务类")
+        ctx.metadata["实体分类名称"] = "业务类"
+        if ctx.period_locked:
+            return
+        current_period = ctx.metadata.get("保管期限", "")
+        if PERIOD_ORDER.get(current_period, 0) < PERIOD_ORDER["30年"]:
+            logger.info(f"[补充规则1] 培训类保管期限: {current_period} → 30年")
+            ctx.metadata["保管期限"] = "30年"
+
+    def _rule_address_change(self, ctx: _RuleCtx) -> None:
+        """规则 3: 档案寄存地址变更 → 10 年"""
+        if not any(kw in ctx.content for kw in ADDRESS_CHANGE_KEYWORDS):
+            return
+        if ctx.period_locked:
+            logger.info(
+                f"[补充规则3] 档案寄存地址变更，期限已锁定（{ctx.metadata.get('保管期限')}），跳过"
+            )
+            return
+        logger.info("[补充规则3] 档案寄存地址变更，保管期限 → 10年")
+        ctx.metadata["保管期限"] = "10年"
+
+    def _rule_maintenance(self, ctx: _RuleCtx) -> None:
+        """规则 4: 公司内部安装/维修类函和通知 → 10 年"""
+        if not any(kw in ctx.content for kw in MAINTENANCE_KEYWORDS):
+            return
+        if not any(doc_type in ctx.title for doc_type in MAINTENANCE_DOC_TYPES):
+            return
+        if ctx.period_locked:
+            logger.info(
+                f"[补充规则4] 安装/维修类，期限已锁定（{ctx.metadata.get('保管期限')}），跳过"
+            )
+            return
+        logger.info("[补充规则4] 安装/维修类通知或函，保管期限 → 10年")
+        ctx.metadata["保管期限"] = "10年"
+
+    def _rule_general_notice(self, ctx: _RuleCtx) -> None:
+        """规则 5: 一般事务性通知 → 10 年（有文号或含重要关键词时不触发）"""
+        if "通知" not in ctx.title:
+            return
+        if self._has_file_number(ctx.metadata):
+            return
+        if any(kw in ctx.content for kw in IMPORTANT_NOTICE_KEYWORDS):
+            return
+        if ctx.period_locked:
+            logger.info(
+                f"[补充规则5] 一般事务通知，期限已锁定（{ctx.metadata.get('保管期限')}），跳过"
+            )
+            return
+        logger.info("[补充规则5] 一般事务通知，保管期限 → 10年")
+        ctx.metadata["保管期限"] = "10年"
+
+    def _rule_regulation(self, ctx: _RuleCtx) -> None:
+        """规则 6: 公司内部制度/管理办法/条例/实施细则/章程 → 综合类，30 年"""
+        if not any(kw in ctx.title for kw in REGULATION_KEYWORDS):
+            return
+        if not any(kw in ctx.content for kw in INTERNAL_ORG_KEYWORDS):
+            return
+        logger.info("[补充规则6] 公司内部制度，分类 → 综合类")
+        ctx.metadata["实体分类名称"] = "综合类"
+        if ctx.period_locked:
+            logger.info(
+                f"[补充规则6] 期限已锁定（{ctx.metadata.get('保管期限')}），不修改期限"
+            )
+            return
+        logger.info("[补充规则6] 保管期限 → 30年")
+        ctx.metadata["保管期限"] = "30年"
+
+    def _rule_criticism(self, ctx: _RuleCtx) -> None:
+        """规则 8: 批评通报 → 30 年"""
+        if not any(kw in ctx.title for kw in ("批评通报", "通报批评")):
+            return
+        if ctx.period_locked:
+            logger.info(
+                f"[补充规则8] 批评通报，期限已锁定（{ctx.metadata.get('保管期限')}），跳过"
+            )
+            return
+        logger.info("[补充规则8] 批评通报，保管期限 → 30年")
+        ctx.metadata["保管期限"] = "30年"
+
+    def _rule_bid(self, ctx: _RuleCtx) -> None:
+        """规则 9: 中标结果公示 / 中标通知函 → 30 年"""
+        if "中标" not in ctx.title or not any(kw in ctx.title for kw in BID_KEYWORDS):
+            return
+        if ctx.period_locked:
+            logger.info(
+                f"[补充规则9] 中标结果，期限已锁定（{ctx.metadata.get('保管期限')}），跳过"
+            )
+            return
+        logger.info("[补充规则9] 中标结果/通知函，保管期限 → 30年")
+        ctx.metadata["保管期限"] = "30年"
+
+    def _rule_party_branch(self, ctx: _RuleCtx) -> None:
+        """规则 10: 党支部更换组织/委员/书记的请示 → 党群类，30 年
+
+        换届选举结果类属永久，检测到即直接跳过（不得被降为 30 年）。
+        """
+        if not any(kw in ctx.content for kw in PARTY_BRANCH_KEYWORDS):
+            return
+        if any(kw in ctx.content for kw in PARTY_BRANCH_ELECTION_RESULT_KEYWORDS):
+            logger.info("[补充规则10] 检测到换届选举结果，跳过（期限应为永久）")
+            return
+        is_adjust = any(kw in ctx.content for kw in PARTY_BRANCH_ADJUST_KEYWORDS)
+        is_target = any(kw in ctx.content for kw in PARTY_BRANCH_TARGET_KEYWORDS)
+        if not (is_adjust and is_target and "请示" in ctx.content):
+            return
+        logger.info("[补充规则10] 党支部调整请示，分类 → 党群类")
+        ctx.metadata["实体分类名称"] = "党群类"
+        if ctx.period_locked:
+            logger.info(
+                f"[补充规则10] 期限已锁定（{ctx.metadata.get('保管期限')}），不修改期限"
+            )
+            return
+        logger.info("[补充规则10] 保管期限 → 30年")
+        ctx.metadata["保管期限"] = "30年"
+
+    def _rule_business_false_positive(self, ctx: _RuleCtx) -> None:
+        """业务类误判兜底：非档案工作/非培训文件 → 强制纠正为综合类"""
+        if ctx.metadata.get("实体分类名称") != "业务类":
+            return
+        if any(kw in ctx.content for kw in BUSINESS_LEGITIMATE_KEYWORDS):
+            return
+        if not any(doc_type in ctx.title for doc_type in BUSINESS_FALSE_POSITIVE_DOC_TYPES):
+            return
+        logger.warning(
+            f"[业务类兜底] 题名含综合类文种（{ctx.title}），非档案/培训文件，强制纠正 → 综合类"
+        )
+        ctx.metadata["实体分类名称"] = "综合类"
+
+    def _rule_with_file_number(self, ctx: _RuleCtx) -> None:
+        """规则 7（兜底）: 本单位带文件编号 → 最少 30 年"""
+        if not self._has_file_number(ctx.metadata):
+            return
+        current_period = ctx.metadata.get("保管期限", "")
+        if PERIOD_ORDER.get(current_period, 0) >= PERIOD_ORDER["30年"]:
+            return
+        if ctx.period_locked:
+            logger.info(f"[补充规则7] 带文件编号，但期限已锁定（{current_period}），跳过")
+            return
+        logger.info(f"[补充规则7] 本单位带文件编号，保管期限: {current_period} → 30年")
+        ctx.metadata["保管期限"] = "30年"
+
+    @staticmethod
+    def _has_file_number(metadata: Dict) -> bool:
+        """判断 metadata 是否含有效的 '文件编号'。"""
+        file_number = metadata.get("文件编号")
+        if not file_number:
+            return False
+        text = str(file_number).strip()
+        return bool(text) and text != "null"
 
     # ── 优先级2：开放状态与延期开放理由 ──────────────────────────────────────
 
@@ -518,4 +571,3 @@ class RulesEngine:
         """
         mapping = CODE_NEW if year >= CODE_SWITCH_YEAR else CODE_OLD
         return mapping.get(category_name, "")
-
