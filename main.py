@@ -113,7 +113,7 @@ def main() -> None:
     logger.info("  Per-archive files: %s/*_result.json", Config.OUTPUT_DIR)
     logger.info("\nStatistics:")
     logger.info("  Total archives: %s", total_count)
-    logger.info("  Success: %s (%.1f%%)", success_count, success_count / total_count * 100)
+    logger.info("  Success: %s (%.1f%%)", success_count, success_count / (total_count or 1) * 100)
     logger.info("  Failed: %s", total_count - success_count)
     logger.info("  Exported rows: %s", json_written)
     logger.info("  Status breakdown: %s", status_counts)

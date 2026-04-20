@@ -37,6 +37,7 @@ class ArchiveClassifier:
         self.rules_engine = RulesEngine()
         self.metadata_schema = METADATA_SCHEMA
         self.extraction_prompt = self._build_extraction_prompt()
+        self.briefing_rewrite_prompt = self._load_prompt_file("briefing_rewrite.txt")
 
     # ── 公开接口 ───────────────────────────────────────────────────────────────
 
@@ -74,13 +75,6 @@ class ArchiveClassifier:
 
         return metadata
 
-    def process_document(self, image_path: str) -> Dict:
-        """处理单个图像文件（兼容旧接口）"""
-        return self.process_multi_page_document(
-            archive_name=Path(image_path).stem,
-            image_paths=[image_path],
-        )
-
     # ── 私有方法 ───────────────────────────────────────────────────────────────
 
     def _extract_metadata_from_text(self, ocr_text: str) -> Dict:
@@ -92,11 +86,54 @@ class ArchiveClassifier:
 
         metadata = self.rules_engine.apply_all(metadata, ocr_text)
 
+        # 规则 11 在标题异常时会设 _需重构简报题名=True，此处是唯一消费者
+        if metadata.pop("_需重构简报题名", False):
+            self._rewrite_briefing_title(metadata, ocr_text)
+
         logger.info(
             f"[LLM] 成功提取 "
             f"{len([v for v in metadata.values() if v is not None])} 个有效字段"
         )
         return metadata
+
+    def _rewrite_briefing_title(self, metadata: Dict, ocr_text: str) -> None:
+        """
+        对文学性简报题名做二次 LLM 重写。
+
+        成功  → 直接改写 metadata["题名"]，不落备注
+        失败  → 不改题名，在 metadata["备注"] 追加"待核查"警告，便于人工复核
+
+        所有分支都必须稳，不得抛异常把整条档案处理流程带崩。
+        """
+        current_title = str(metadata.get("题名") or "").strip()
+        responsible_party = str(metadata.get("责任者") or "").strip()
+
+        new_title = ""
+        try:
+            new_title = self.llm_client.rewrite_briefing_title(
+                ocr_text=ocr_text,
+                current_title=current_title,
+                responsible_party=responsible_party,
+                prompt=self.briefing_rewrite_prompt,
+            )
+        except Exception as exc:
+            logger.exception(f"[题名重写] 二次调用抛异常: {exc}")
+
+        if new_title and "简报" in new_title and new_title != current_title:
+            logger.info(f"[题名重写] {current_title!r} → {new_title!r}")
+            metadata["题名"] = new_title
+            return
+
+        reason = (
+            "二次调用未返回有效题名"
+            if not new_title
+            else f"模型返回不含'简报'二字: {new_title!r}"
+        )
+        logger.warning(f"[题名重写失败] {reason}，保留原题名")
+
+        warning = f"【待核查】简报题名疑为文学性标题，需补充责任者及活动事由: {current_title}"
+        existing = (metadata.get("备注") or "").strip()
+        metadata["备注"] = f"{existing} {warning}".strip() if existing else warning
 
     def _load_prompt_file(self, filename: str) -> str:
         """加载单个规则文件，文件不存在时快速失败"""

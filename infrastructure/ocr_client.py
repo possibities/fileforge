@@ -7,6 +7,7 @@
 from dataclasses import dataclass, field
 import logging
 import re
+import statistics
 from pathlib import Path
 from typing import Any, List, Sequence, Tuple
 
@@ -404,8 +405,7 @@ class OcrClient:
                 }
             )
 
-        heights_sorted = sorted(heights)
-        median_h = heights_sorted[len(heights_sorted) // 2] if heights_sorted else _FALLBACK_LINE_HEIGHT
+        median_h = statistics.median(heights) if heights else _FALLBACK_LINE_HEIGHT
         if median_h <= 0:
             median_h = _FALLBACK_LINE_HEIGHT
 

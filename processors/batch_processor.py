@@ -394,14 +394,6 @@ class BatchProcessor:
             },
         }
 
-    def batch_process(
-        self,
-        image_paths: List[str],
-        output_dir: Optional[str] = None,
-    ) -> List[Dict]:
-        archive_dict = {Path(image_path).stem: [image_path] for image_path in image_paths}
-        return self.batch_process_archives(archive_dict, output_dir)
-
     def process_directory(
         self,
         directory_path: str,

@@ -1,0 +1,34 @@
+# 仓库统一行尾策略
+#   - 文本文件：入库一律 LF，checkout 时也保持 LF（跨平台一致，CI 友好）
+#   - 二进制文件：跳过所有换行转换
+
+* text=auto eol=lf
+
+# ── 显式声明常见文本文件（防止误判） ──────────────────────────────────────────
+*.py     text eol=lf
+*.md     text eol=lf
+*.txt    text eol=lf
+*.json   text eol=lf
+*.yaml   text eol=lf
+*.yml    text eol=lf
+*.toml   text eol=lf
+*.cfg    text eol=lf
+*.ini    text eol=lf
+*.sh     text eol=lf
+
+# ── 二进制文件（不做行尾处理） ──────────────────────────────────────────────
+*.png         binary
+*.jpg         binary
+*.jpeg        binary
+*.gif         binary
+*.bmp         binary
+*.tif         binary
+*.tiff        binary
+*.pdf         binary
+*.ico         binary
+*.gguf        binary
+*.safetensors binary
+*.bin         binary
+*.pkl         binary
+*.zip         binary
+*.gz          binary

@@ -88,6 +88,50 @@ class LlmClient:
             logger.exception(f"[LLM错误] {str(e)}")
             return {}
 
+    def rewrite_briefing_title(
+        self,
+        ocr_text: str,
+        current_title: str,
+        responsible_party: str,
+        prompt: str,
+        ocr_char_limit: int = 3000,
+    ) -> str:
+        """
+        二次调用 LLM，重写"文学性简报题名"为规范题名。
+
+        返回：
+          - 重写成功 → 新题名字符串（调用方仍需校验是否以"简报"结尾）
+          - LLM 认为信息不足（返回与原题名相同）/ 解析失败 / 异常 → 空字符串
+        """
+        if not current_title:
+            return ""
+
+        excerpt = ocr_text[:ocr_char_limit] if ocr_text else ""
+        formatted = (
+            prompt
+            .replace("{current_title}", current_title)
+            .replace("{responsible_party}", responsible_party or "未知")
+            .replace("{ocr_text}", excerpt)
+        )
+
+        logger.info("[LLM] 二次调用：重写文学性简报题名...")
+        try:
+            response = self._generate(formatted)
+            response = self._clean_response(response)
+            parsed = self._parse_json(response)
+        except Exception as e:
+            logger.exception(f"[LLM重写异常] {e}")
+            return ""
+
+        new_title = str(parsed.get("题名") or "").strip() if parsed else ""
+        if not new_title:
+            logger.warning("[LLM重写] 未解析出题名字段")
+            return ""
+        if new_title == current_title:
+            logger.info("[LLM重写] 模型认为无法重写，保留原题名")
+            return ""
+        return new_title
+
     # ── 推理调用 ──────────────────────────────────────────────────────────────
 
     def _generate(self, prompt: str) -> str:
@@ -137,29 +181,23 @@ class LlmClient:
             start_idx = response.find('{')
             end_idx = response.rfind('}')
             response = response[start_idx:end_idx + 1]
-        lines = response.split('\n')
-        json_lines = []
-        in_json = False
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('{'):
-                in_json = True
-            if in_json:
-                json_lines.append(line)
-            if stripped.endswith('}') and in_json:
-                break
-        if json_lines:
-            response = '\n'.join(json_lines)
         return response.strip()
 
     def _parse_json(self, response: str) -> Dict:
+        """
+        解析 LLM 返回的 JSON 响应。
+
+        vLLM `response_format={"type": "json_object"}` 保证返回合法 JSON，
+        但为防 guided JSON 失效或超长截断，保留一次引号/尾逗号修复重试。
+        修复仍失败则放弃并打印完整响应，便于排查。
+        """
         try:
             metadata = json.loads(response)
-            metadata = {k: v for k, v in metadata.items() if k in self.metadata_schema}
-            return metadata
+            return {k: v for k, v in metadata.items() if k in self.metadata_schema}
         except json.JSONDecodeError as e:
             logger.warning(f"[JSON解析失败] {str(e)}")
             logger.info("[尝试修复JSON格式...]")
+
         # 仅替换 JSON 结构位的单引号：key 周围（{'k': / ,'k':）与简单 value 位置（: 'v',）
         # 不做全局 replace，避免破坏字符串值中合法的单引号
         fixed = re.sub(r"([{,]\s*)'([^'\n]+?)'(\s*:)", r'\1"\2"\3', response)
@@ -167,53 +205,11 @@ class LlmClient:
         fixed = re.sub(r',(\s*[}\]])', r'\1', fixed)
         try:
             metadata = json.loads(fixed)
-            metadata = {k: v for k, v in metadata.items() if k in self.metadata_schema}
             logger.info("[修复成功] 成功提取字段")
-            return metadata
+            return {k: v for k, v in metadata.items() if k in self.metadata_schema}
         except Exception:
-            pass
-        logger.info("[尝试正则表达式提取...]")
-        metadata = self._extract_fields_by_regex(response)
-        if metadata:
-            logger.info(f"[正则提取] 成功提取 {len(metadata)} 个字段")
-            return metadata
-        logger.warning("[完整响应内容]")
-        logger.warning("-" * 70)
-        logger.warning(response)
-        logger.warning("-" * 70)
-        return {}
-
-    def _extract_fields_by_regex(self, text: str) -> Dict:
-        metadata = {}
-        pattern = re.compile(
-            r'"([^"]+)"\s*:\s*("(?:[^"\\]|\\.)*"|null|true|false|-?\d+(?:\.\d+)?|\[.*?\]|\{.*?\})',
-            re.S,
-        )
-        for key, raw_value in pattern.findall(text):
-            if key not in self.metadata_schema:
-                continue
-
-            value = raw_value.strip()
-            if value == "null":
-                metadata[key] = None
-            elif value == "true":
-                metadata[key] = True
-            elif value == "false":
-                metadata[key] = False
-            elif value.startswith('"') and value.endswith('"'):
-                try:
-                    metadata[key] = json.loads(value)
-                except json.JSONDecodeError:
-                    metadata[key] = value[1:-1]
-            elif re.fullmatch(r'-?\d+', value):
-                metadata[key] = int(value)
-            elif re.fullmatch(r'-?\d+\.\d+', value):
-                metadata[key] = float(value)
-            elif value.startswith('[') or value.startswith('{'):
-                try:
-                    metadata[key] = json.loads(value)
-                except json.JSONDecodeError:
-                    metadata[key] = value
-            else:
-                metadata[key] = value
-        return metadata
+            logger.warning("[JSON修复失败] 完整响应:")
+            logger.warning("-" * 70)
+            logger.warning(response)
+            logger.warning("-" * 70)
+            return {}

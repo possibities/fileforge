@@ -26,6 +26,7 @@ from constants import (
     BID_KEYWORDS,
     BRIEFING_BUSINESS_KEYWORDS,
     BRIEFING_PARTY_KEYWORDS,
+    BRIEFING_SUBSTANTIVE_VERBS,
     IMPORTANT_NOTICE_KEYWORDS,
     INTERNAL_ORG_KEYWORDS,
     MAINTENANCE_DOC_TYPES,
@@ -83,9 +84,6 @@ class RulesEngine:
 
     def _force_fix_fields(self, metadata: Dict) -> Dict:
         """强制留空字段 + 立档单位名称同步责任者 + 密级合法值校验"""
-        if not metadata:
-            return metadata
-
         # 立档单位名称与责任者保持一致
         if not metadata.get("立档单位名称"):
             metadata["立档单位名称"] = metadata.get("责任者")
@@ -117,9 +115,6 @@ class RulesEngine:
           - 规则 7（文件编号兜底）最后执行
           - 分类编码校验统一由 apply_all 收尾一次，规则内部不再触发
         """
-        if not metadata:
-            return metadata
-
         title = str(metadata.get("题名") or "").strip()
         ctx = _RuleCtx(
             metadata=metadata,
@@ -327,17 +322,13 @@ class RulesEngine:
         工作秘密仅以密级标注字段（CONTROLLED_SECURITY_LEVELS）为准，不扫描正文
         延期开放理由只填最主要一个原因
         """
-        if not metadata:
-            return metadata
-
         title = str(metadata.get("题名") or "").strip()
         text = ocr_text or ""
 
         metadata["开放状态"] = "开放"
         metadata["延期开放理由"] = None
 
-        # 第一优先级：密级字段标注
-        # [Fix6] 仅使用 CONTROLLED_SECURITY_LEVELS，不再扫描正文 WORK_SECRET_KEYWORDS
+        # 第一优先级：密级字段标注（仅看 CONTROLLED_SECURITY_LEVELS，不扫描正文）
         if metadata.get("密级") in CONTROLLED_SECURITY_LEVELS:
             metadata["开放状态"] = "控制"
             metadata["延期开放理由"] = "工作秘密"
@@ -381,9 +372,6 @@ class RulesEngine:
         根据文件形成时间年份判断编码
         优先取文件形成时间前4位，降级使用归档年度
         """
-        if not metadata:
-            return metadata
-
         year = None
 
         # 优先：文件形成时间（格式YYYYMMDD）
@@ -444,9 +432,6 @@ class RulesEngine:
           - [ ]内容与原题名不同的合法另拟（如 通知[共青团中央关于…的通知]）
           - 合订件标注（如 关于XX的复函[及函]）
         """
-        if not metadata:
-            return metadata
-
         title = str(metadata.get("题名") or "").strip()
         if not title:
             return metadata
@@ -541,25 +526,21 @@ class RulesEngine:
         #   c) 题名不含动词+宾语结构（即不含"关于"、"开展"、"召开"等实质事由词）
         #   d) 题名不以"["开头（已另拟的不再处理）
         # 处理方式：
-        #   仅标记 metadata["_需重构简报题名"] = True，交由LLM二次调用或人工核查
-        #   规则引擎不自动拼接责任者（责任者字段来源不稳定，硬拼接易出错）
-        SUBSTANTIVE_VERBS = [
-            "关于", "开展", "召开", "组织", "举办", "开办",
-            "推进", "落实", "部署", "传达", "学习", "讨论",
-        ]
+        #   仅设置 metadata["_需重构简报题名"] = True 作为标志位，
+        #   真正的重写和备注落地由 ArchiveClassifier._rewrite_briefing_title 负责：
+        #     - 调用成功 → 替换题名
+        #     - 调用失败 → 在备注写入"待核查"警告
+        #   这里不写备注、不拼机构名，避免规则引擎硬拼题名翻车。
         if (
             "简报" in title
             and "——" not in title
             and not title.startswith("[")
-            and not any(v in title for v in SUBSTANTIVE_VERBS)
+            and not any(v in title for v in BRIEFING_SUBSTANTIVE_VERBS)
         ):
             logger.warning(
-                f"[规则11] 疑似文学性简报标题，未含机构+事由，建议人工核查: {title!r}"
+                f"[规则11] 疑似文学性简报标题，标记待二次 LLM 重写: {title!r}"
             )
-            metadata["备注"] = (
-                (metadata.get("备注") or "")
-                + f"【待核查】简报题名疑为文学性标题，需补充责任者及活动事由: {title}"
-            ).strip()
+            metadata["_需重构简报题名"] = True
 
         return metadata
 
