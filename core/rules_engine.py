@@ -15,6 +15,7 @@ from constants import (
     COMMERCIAL_EXEMPT_KEYWORDS,
     COMMERCIAL_KEYWORDS,
     CONTROLLED_SECURITY_LEVELS,
+    EXPORT_RESERVED_FIELDS,
     NEGATIVE_PATTERNS,
     NEGATIVE_TITLE_KEYWORDS,
     PERIOD_ORDER,
@@ -84,6 +85,13 @@ class RulesEngine:
 
     def _force_fix_fields(self, metadata: Dict) -> Dict:
         """强制留空字段 + 立档单位名称同步责任者 + 密级合法值校验"""
+        for field, default in EXPORT_RESERVED_FIELDS.items():
+            metadata.setdefault(field, default)
+
+        # 这两个字段在当前项目中属于下游模板保留位，始终显式置空。
+        metadata["档案馆代码"] = None
+        metadata["档案馆名称"] = None
+
         # 立档单位名称与责任者保持一致
         if not metadata.get("立档单位名称"):
             metadata["立档单位名称"] = metadata.get("责任者")

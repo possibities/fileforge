@@ -19,13 +19,15 @@ AWQ 4bit 量化，单卡 ≥ 24 GB 显存即可；80 GB A100/H100 可顺畅跑 3
 ```bash
 vllm serve ~/.cache/huggingface/hub/Qwen3-32B-AWQ \
   --served-model-name qwen3-32b-awq \
-  --host 0.0.0.0 \
+  --host 127.0.0.1 \
   --port 8000 \
   --quantization awq_marlin \
   --dtype auto \
   --max-model-len 8192 \
   --gpu-memory-utilization 0.90
 ```
+sudo pkill -f vllm
+
 
 关键参数说明：
 

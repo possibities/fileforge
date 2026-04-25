@@ -5,15 +5,11 @@ import unittest
 from constants import METADATA_SCHEMA
 
 
-# Provide a lightweight stub so importing llm_client does not require runtime llama.cpp.
-if "llama_cpp" not in sys.modules:
-    llama_cpp_stub = types.ModuleType("llama_cpp")
-
-    class _DummyLlama:  # pragma: no cover - constructor is never used in these tests.
-        pass
-
-    llama_cpp_stub.Llama = _DummyLlama
-    sys.modules["llama_cpp"] = llama_cpp_stub
+# Keep imports lightweight if optional SDKs are absent in the test environment.
+if "openai" not in sys.modules:
+    openai_stub = types.ModuleType("openai")
+    openai_stub.OpenAI = object
+    sys.modules["openai"] = openai_stub
 
 from infrastructure.llm_client import LlmClient
 
@@ -73,6 +69,22 @@ class TestLlmClientRegexFallback(unittest.TestCase):
 
         self.assertIn(key_text, metadata)
         self.assertNotIn("unknown_key", metadata)
+
+    def test_parse_json_falls_back_to_field_extraction_on_truncated_payload(self):
+        client = self._build_client()
+        key_text = list(METADATA_SCHEMA.keys())[0]
+        key_year = list(METADATA_SCHEMA.keys())[1]
+        raw = (
+            "{"
+            f"\"{key_text}\": \"ok\", "
+            f"\"{key_year}\": 2020, "
+            "\"unknown\": "
+        )
+
+        metadata = client._parse_json(raw)
+
+        self.assertEqual(metadata[key_text], "ok")
+        self.assertEqual(metadata[key_year], 2020)
 
 
 if __name__ == "__main__":

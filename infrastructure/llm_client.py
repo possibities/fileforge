@@ -10,7 +10,7 @@
 import json
 import logging
 import re
-from typing import Dict
+from typing import Any, Dict
 
 try:
     from openai import OpenAI
@@ -189,11 +189,11 @@ class LlmClient:
 
         vLLM `response_format={"type": "json_object"}` 保证返回合法 JSON，
         但为防 guided JSON 失效或超长截断，保留一次引号/尾逗号修复重试。
-        修复仍失败则放弃并打印完整响应，便于排查。
+        修复仍失败时，降级为按字段逐个抽取的兜底解析。
         """
         try:
             metadata = json.loads(response)
-            return {k: v for k, v in metadata.items() if k in self.metadata_schema}
+            return self._filter_metadata_keys(metadata)
         except json.JSONDecodeError as e:
             logger.warning(f"[JSON解析失败] {str(e)}")
             logger.info("[尝试修复JSON格式...]")
@@ -206,10 +206,43 @@ class LlmClient:
         try:
             metadata = json.loads(fixed)
             logger.info("[修复成功] 成功提取字段")
-            return {k: v for k, v in metadata.items() if k in self.metadata_schema}
+            return self._filter_metadata_keys(metadata)
         except Exception:
+            metadata = self._extract_fields_by_regex(fixed)
+            if metadata:
+                logger.info("[JSON兜底] 通过逐字段抽取恢复部分字段")
+                return metadata
             logger.warning("[JSON修复失败] 完整响应:")
             logger.warning("-" * 70)
             logger.warning(response)
             logger.warning("-" * 70)
             return {}
+
+    def _filter_metadata_keys(self, metadata: Dict[str, Any]) -> Dict:
+        return {k: v for k, v in metadata.items() if k in self.metadata_schema}
+
+    def _extract_fields_by_regex(self, response: str) -> Dict:
+        """
+        在整体 JSON 解析失败时，按允许字段逐个定位并解析值。
+
+        该兜底路径主要覆盖以下场景：
+          - 顶层 JSON 被截断，但前部字段仍然完整
+          - 模型输出额外噪声，导致整体对象无法一次性解析
+        """
+        decoder = json.JSONDecoder()
+        metadata: Dict[str, Any] = {}
+
+        for key in self.metadata_schema:
+            pattern = rf'"{re.escape(key)}"\s*:'
+            match = re.search(pattern, response)
+            if not match:
+                continue
+
+            value_text = response[match.end():].lstrip()
+            try:
+                value, _ = decoder.raw_decode(value_text)
+            except json.JSONDecodeError:
+                continue
+            metadata[key] = value
+
+        return metadata
