@@ -124,11 +124,12 @@ class ArchiveClassifier:
             metadata["题名"] = new_title
             return
 
-        reason = (
-            "二次调用未返回有效题名"
-            if not new_title
-            else f"模型返回不含'简报'二字: {new_title!r}"
-        )
+        if not new_title:
+            reason = "二次调用未返回有效题名"
+        elif "简报" not in new_title:
+            reason = f"模型返回不含'简报'二字: {new_title!r}"
+        else:
+            reason = f"模型返回与原题名相同: {new_title!r}"
         logger.warning(f"[题名重写失败] {reason}，保留原题名")
 
         warning = f"【待核查】简报题名疑为文学性标题，需补充责任者及活动事由: {current_title}"
